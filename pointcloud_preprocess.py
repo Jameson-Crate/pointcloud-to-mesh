@@ -62,6 +62,50 @@ def extend_mask(mask, kernel_size=5, method='max'):
     
     return extended_mask
 
+def depth_gradient_mask(input_mask, depth, threshold):
+    """
+    Create a mask where the gradient magnitude of the depth map is below a threshold,
+    filtered by an input mask.
+    
+    Args:
+        input_mask (numpy.ndarray): Initial binary mask to filter by [H, W].
+        depth (numpy.ndarray): Depth map [H, W].
+        threshold (float): Threshold for gradient magnitude.
+        
+    Returns:
+        numpy.ndarray: Binary mask where gradient magnitude is below threshold and input_mask is True.
+    """
+    # Ensure input_mask is a 2D binary mask
+    if len(input_mask.shape) == 3:
+        # If it's a 3-channel mask, convert to single channel
+        if input_mask.shape[2] == 3:
+            # Try to find the channel with content
+            for c in range(3):
+                if input_mask[..., c].sum() > 0:
+                    input_mask = input_mask[..., c].astype(bool)
+                    break
+            # If no channel found with content, use the first channel
+            if len(input_mask.shape) == 3:
+                input_mask = input_mask[..., 0].astype(bool)
+    
+    # First apply the input mask
+    masked_depth = depth.copy() * (1.0 - input_mask)
+    
+    # Compute gradients in x and y directions
+    # Use Sobel filter for better noise handling
+    # Convert masked_depth to float32 before applying Sobel
+    masked_depth_float = masked_depth.astype(np.float32)
+    grad_x = cv2.Sobel(masked_depth_float, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(masked_depth_float, cv2.CV_32F, 0, 1, ksize=3)
+    
+    # Compute gradient magnitude (L2 norm)
+    gradient_magnitude = np.sqrt(grad_x**2 + grad_y**2)
+    
+    # Create mask where gradient magnitude is above threshold AND input mask is True
+    gradient_mask = (gradient_magnitude > threshold) | input_mask
+    
+    return gradient_mask
+
 class MegaSamReader:
     """
     Used to read sgd_cvd_hr.npz and load corresponding segmentation masks based on the given object name list.
@@ -78,6 +122,8 @@ class MegaSamReader:
         # Read color / depth / camera parameters / poses
         self.color_files = data['images']   # (N, H, W, 3) uint8
         self.depth_files = data['depths']   # (N, H, W) float16
+        # take a gradient of the depth map to get a valid mask, thre out those of high gradient value
+
         self.K = data['intrinsic'].astype(np.float64)  # (3, 3) float32
         self.camera_poses = data['cam_c2w'] # (N, 4, 4) float32
         # Get corresponding object segmentation masks from the file system
@@ -119,7 +165,7 @@ class MegaSamReader:
     def get_extrinsic(self, i):
         return self.camera_poses[i]
 
-    def get_mask(self, i, object_name, extend_mask_kernel=None, extend_mask_method='max'):
+    def get_mask(self, i, object_name, extend_mask_kernel=None, extend_mask_method='max', depth_gradient_thresh=None):
         if object_name not in self.masks:
             raise ValueError(f"Object '{object_name}' not found in mask list.")
         
@@ -145,16 +191,22 @@ class MegaSamReader:
         # Apply mask extension if specified
         if extend_mask_kernel is not None and extend_mask_kernel > 0:
             mask = extend_mask(mask, extend_mask_kernel, extend_mask_method)
+        
+        # Apply depth map if specified
+        if depth_gradient_thresh:
+            depth = self.depth_files[i]
+            mask = depth_gradient_mask(mask, depth, depth_gradient_thresh)
             
         return mask
 
-def save_point_cloud(xyz_map, color, masks, output_file="point_cloud.ply"):
+def save_point_cloud(xyz_map, color, masks, c2w, output_file="point_cloud.ply"):
     """
     Save a point cloud as .ply after removing specified objects.
     Args:
         xyz_map (numpy.ndarray): [H, W, 3] 3D coordinates.
         color (numpy.ndarray): [H, W, 3] image colors.
         masks (list of numpy.ndarray): Masks for each target object [H, W].
+        c2w (numpy.ndarray): [4, 4] camera-to-world transformation matrix.
         output_file (str): Output filename.
     """
     if not masks:
@@ -165,16 +217,23 @@ def save_point_cloud(xyz_map, color, masks, output_file="point_cloud.ply"):
     # Extract valid points and colors
     points = xyz_map[valid_mask]
     colors = color[valid_mask] / 255.0  # Convert to [0,1] range
+    
+    # Convert points from camera coordinates to world coordinates
+    # Add homogeneous coordinate (1) to each point
+    points_homogeneous = np.hstack((points, np.ones((points.shape[0], 1))))
+    # Transform points to world coordinates
+    points_world = np.dot(points_homogeneous, c2w.T)[:, :3]
+    
     # Create Open3D point cloud
     pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
+    pcd.points = o3d.utility.Vector3dVector(points_world)
     pcd.colors = o3d.utility.Vector3dVector(colors)
     # Write PLY file
     o3d.io.write_point_cloud(str(output_file), pcd)
     print(f"Saved point cloud to {output_file}")
 
 def combine_point_clouds(reader, frame_indices, object_names, sampling_factor=None, 
-                         extend_mask_kernel=None, extend_mask_method='max'):
+                         extend_mask_kernel=None, extend_mask_method='max', depth_gradient_thresh=None):
     """
     Combine multiple frames into a single downsampled point cloud.
     
@@ -185,6 +244,7 @@ def combine_point_clouds(reader, frame_indices, object_names, sampling_factor=No
         sampling_factor (float, optional): Sampling factor for each frame (0-1). If None, defaults to 1/len(frame_indices).
         extend_mask_kernel (int, optional): Kernel size for mask extension.
         extend_mask_method (str): Method for mask extension ('max', 'mode').
+        depth_gradient_thresh (bool, optional): Take the depth gradient mask
         
     Returns:
         open3d.geometry.PointCloud: The combined point cloud.
@@ -195,6 +255,8 @@ def combine_point_clouds(reader, frame_indices, object_names, sampling_factor=No
     if sampling_factor is None:
         sampling_factor = 1.0 / len(frame_indices) if len(frame_indices) > 0 else 1.0
     
+    print(f"Sampling factor: {sampling_factor}")
+    
     for idx in tqdm(frame_indices):
         # Get data for this frame
         xyz_map = reader.get_xyz_map(idx)
@@ -202,7 +264,7 @@ def combine_point_clouds(reader, frame_indices, object_names, sampling_factor=No
         # Get masks and ensure they are 2D
         masks = []
         for obj in object_names:
-            mask = reader.get_mask(idx, obj, extend_mask_kernel, extend_mask_method)
+            mask = reader.get_mask(idx, obj, extend_mask_kernel, extend_mask_method, depth_gradient_thresh)
             # Ensure mask is 2D
             if len(mask.shape) > 2:
                 # If mask has more dimensions, convert to 2D binary mask
@@ -236,9 +298,20 @@ def combine_point_clouds(reader, frame_indices, object_names, sampling_factor=No
         if len(points) == 0:
             continue
         
+        # Transform points from camera coordinates to world coordinates
+        # Get the camera pose for this frame
+        c2w = reader.camera_poses[idx]
+        
+        # Convert points to homogeneous coordinates
+        homogeneous_points = np.ones((points.shape[0], 4))
+        homogeneous_points[:, :3] = points
+        
+        # Apply the transformation
+        world_points = np.dot(homogeneous_points, c2w.T)[:, :3]
+        
         # Create point cloud for this frame
         frame_pcd = o3d.geometry.PointCloud()
-        frame_pcd.points = o3d.utility.Vector3dVector(points)
+        frame_pcd.points = o3d.utility.Vector3dVector(world_points)
         frame_pcd.colors = o3d.utility.Vector3dVector(colors)
         
         # Downsample this frame's point cloud before combining
@@ -257,7 +330,7 @@ def main():
     Usage:
     python pointcloud_preprocess.py --parent_dir /home/.../new_kitchen_pick [--combine_frames] 
                                     [--frame_step 1] [--sampling_factor 0.1] 
-                                    [--extend_mask_kernel 5] [--extend_mask_method max]
+                                    [--extend_mask_kernel 5] [--extend_mask_method max] [--depth_gradient_thresh]
     Logic:
       - Iterate through all subdirectories under parent_dir
       - For each subdirectory:
@@ -279,6 +352,8 @@ def main():
                         help="Kernel size for extending object masks (if not specified, no extension)")
     parser.add_argument("--extend_mask_method", type=str, default="max", choices=["max", "mode"],
                         help="Method for extending mask edges ('max' or 'mode')")
+    parser.add_argument("--depth_gradient_thresh", type=float, default=None,
+                        help="Enable depth gradient processing from threshold")
     
     args = parser.parse_args()
     parent_path = Path(args.parent_dir)
@@ -327,7 +402,8 @@ def main():
                     object_names,
                     sampling_factor=args.sampling_factor,
                     extend_mask_kernel=args.extend_mask_kernel,
-                    extend_mask_method=args.extend_mask_method
+                    extend_mask_method=args.extend_mask_method,
+                    depth_gradient_thresh=args.depth_gradient_thresh
                 )
                 
                 # Save the combined point cloud
@@ -338,11 +414,11 @@ def main():
                 # Process just frame 0
                 color = reader.get_color(0)
                 xyz_map = reader.get_xyz_map(0)
-                masks = [reader.get_mask(0, obj, args.extend_mask_kernel, args.extend_mask_method) 
+                masks = [reader.get_mask(0, obj, args.extend_mask_kernel, args.extend_mask_method, args.depth_gradient_thresh) 
                          for obj in object_names]
                 
                 # Save point cloud after removing objects
-                save_point_cloud(xyz_map, color, masks, output_file)
+                save_point_cloud(xyz_map, color, masks, reader.camera_poses[0], output_file)
                 print(f"[{subfolder.name}] Processing complete, output: {output_file}")
                 
         except Exception as e:
