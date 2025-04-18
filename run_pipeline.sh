@@ -5,12 +5,16 @@
 
 # Check if data directory argument is provided
 if [ -z "$1" ]; then
-    echo "Usage: $0 <data_directory>"
-    exit 1
+    echo "Usage: $0 <data_directory> [output_directory]"
+    return 1
 fi
 
 DATA_DIR="$1"
-OUTPUT_DIR="${DATA_DIR}/output"
+if [ -z "$2" ]; then
+    OUTPUT_DIR="${DATA_DIR}/output"
+else
+    OUTPUT_DIR="$2"
+fi
 mkdir -p "$OUTPUT_DIR"
 
 echo "===== Starting pipeline processing ====="
@@ -25,7 +29,7 @@ python3 single_preprocess.py --data_dir "$DATA_DIR" --combine_frames --frame_ste
 POINT_CLOUD="${DATA_DIR}/point_clouds/scene.ply"
 if [ ! -f "$POINT_CLOUD" ]; then
     echo "Error: Failed to generate point cloud at ${POINT_CLOUD}"
-    exit 1
+    return 1
 fi
 
 echo "Point cloud generated: $POINT_CLOUD"
@@ -37,7 +41,7 @@ python3 run_nksr.py "$POINT_CLOUD" --output "$NKSR_OUTPUT" --detail 0.3
 
 if [ ! -f "$NKSR_OUTPUT" ]; then
     echo "Error: Failed to generate NKSR mesh at ${NKSR_OUTPUT}"
-    exit 1
+    return 1
 fi
 
 echo "NKSR mesh generated: $NKSR_OUTPUT"
@@ -64,7 +68,7 @@ alpha_wrap/build/AlphaWrap --alpha 100 --outdir "$ALPHA_WRAP_OUTPUT" "$NKSR_OUTP
 ALPHA_WRAP_MESH="${ALPHA_WRAP_OUTPUT}/output.off"
 if [ ! -f "$ALPHA_WRAP_MESH" ]; then
     echo "Error: Failed to generate Alpha Wrap mesh at ${ALPHA_WRAP_MESH}"
-    exit 1
+    return 1
 fi
 
 echo "Alpha Wrap mesh generated: $ALPHA_WRAP_MESH"
@@ -72,11 +76,11 @@ echo "Alpha Wrap mesh generated: $ALPHA_WRAP_MESH"
 # Step 4: Texture mapping from original point cloud to final mesh
 echo "===== Step 4: Applying texture mapping ====="
 FINAL_OUTPUT="${OUTPUT_DIR}/final_textured_mesh.ply"
-python3 texture_map.py "$POINT_CLOUD" "$ALPHA_WRAP_MESH" --output "$FINAL_OUTPUT"
+python3 texture_map.py "$POINT_CLOUD" "$ALPHA_WRAP_MESH" --upsample 0.8 --output "$FINAL_OUTPUT"
 
 if [ ! -f "$FINAL_OUTPUT" ]; then
     echo "Error: Failed to generate textured mesh at ${FINAL_OUTPUT}"
-    exit 1
+    return 1
 fi
 
 echo "===== Pipeline completed successfully! ====="

@@ -107,13 +107,13 @@ int main(int argc, char** argv)
     
     Mesh wrap;
     CGAL::alpha_wrap_3(mesh, alpha, offset, wrap);
-    
+
     t.stop();
     std::cout << "Result: " << num_vertices(wrap) << " vertices, " << num_faces(wrap) << " faces" << std::endl;
     std::cout << "Took " << t.time() << " s." << std::endl;
     
     // Save the result
-    const std::string output_name = generate_output_name(filename, relative_alpha, relative_offset, output_dir);
+    const std::string output_name = output_dir + "/output.off";
     std::cout << "Writing to " << output_name << std::endl;
     CGAL::IO::write_polygon_mesh(output_name, wrap, CGAL::parameters::stream_precision(17));
     

@@ -63,10 +63,12 @@ Thumbs.db
 .cache
 
 # Output directories
-output/
+outputs/
 blender-convention/
 colmap-convention/
+megasam-data
 megasam-data/
+experiments/
 
 # Logging directories
 logs/
